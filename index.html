@@ -302,6 +302,35 @@
             animation: fadeIn 0.3s ease-out;
         }
 
+        .footer {
+            position: fixed;
+            bottom: 0;
+            left: 0;
+            right: 0;
+            background: linear-gradient(180deg, transparent 0%, rgba(26, 22, 37, 0.95) 50%);
+            padding: 20px;
+            text-align: center;
+            font-size: 0.9rem;
+            color: var(--text-muted);
+            z-index: 100;
+            backdrop-filter: blur(10px);
+        }
+
+        .footer-content {
+            max-width: 1200px;
+            margin: 0 auto;
+        }
+
+        .footer a {
+            color: var(--accent);
+            text-decoration: none;
+            transition: color 0.3s ease;
+        }
+
+        .footer a:hover {
+            color: var(--primary);
+        }
+
         canvas {
             display: block;
             border: 2px solid #e5e7eb;
@@ -849,6 +878,7 @@
         let timerInterval = null;
         let gameStarted = false;
         let roundEnding = false; // Flag to prevent multiple round ends
+        let isTransitioning = false; // Flag to prevent overlapping round transitions
 
         // Canvas
         const canvas = document.getElementById('drawingCanvas');
@@ -1072,28 +1102,26 @@
                 updatePlayersList(players);
                 
                 const playerCount = Object.keys(players).length;
+                const playerIds = Object.keys(players).sort();
+                const leaderId = playerIds[0]; // First player alphabetically is the leader
+                const isLeader = (leaderId === playerId);
                 
-                // Auto-start game when 2+ players join
-                if (playerCount >= 2 && !gameStarted) {
+                // Only leader can start the game
+                if (playerCount >= 2 && !gameStarted && isLeader) {
                     roomRef.child('gameState/started').once('value', (snap) => {
                         if (!snap.val()) {
-                            // Use random delay and check again to prevent race
-                            const delay = Math.random() * 800 + 1200; // 1.2-2 seconds
+                            console.log('Leader starting initial game');
                             setTimeout(() => {
-                                roomRef.child('gameState').once('value', (stateSnap) => {
-                                    const state = stateSnap.val();
-                                    // Only start if not already started and not starting
-                                    if (!state.started && !state.roundStarting) {
-                                        startNewRound();
-                                    }
-                                });
-                            }, delay);
+                                startNewRound();
+                            }, 2000);
                         }
                     });
                 }
 
-                // Check if all players guessed correctly
-                checkAllGuessed(players);
+                // Check if all players guessed correctly (only leader checks)
+                if (isLeader) {
+                    checkAllGuessed(players);
+                }
             });
 
             roomRef.child('gameState').on('value', (snapshot) => {
@@ -1127,6 +1155,10 @@
 
             const playerIds = Object.keys(players);
             if (playerIds.length < 2) return;
+            
+            // Verify I'm the leader (only leader checks this)
+            const leaderId = playerIds.sort()[0];
+            if (leaderId !== playerId) return;
 
             // Find who is drawing
             const drawerId = playerIds.find(id => players[id].isDrawing);
@@ -1136,8 +1168,9 @@
             const otherPlayers = playerIds.filter(id => id !== drawerId);
             const allGuessed = otherPlayers.every(id => players[id].guessedCorrectly);
 
-            if (allGuessed && otherPlayers.length > 0) {
+            if (allGuessed && otherPlayers.length > 0 && !roundEnding) {
                 // All players guessed correctly! End round early
+                console.log('All players guessed correctly, ending round');
                 roundEnding = true;
                 
                 if (timerInterval) {
@@ -1157,6 +1190,15 @@
         }
 
         function handleGameStateUpdate(state) {
+            if (!state) return;
+            
+            console.log('Game state update:', {
+                roundNumber: state.roundNumber,
+                currentDrawer: state.currentDrawer,
+                timeLeft: state.timeLeft,
+                myId: playerId
+            });
+            
             if (state.started && !gameStarted) {
                 gameStarted = true;
                 showGameScreen();
@@ -1168,24 +1210,47 @@
                 // STRICT check: only set isDrawing if this player is THE current drawer
                 const shouldBeDrawing = (state.currentDrawer === playerId);
                 
-                // Update local state
+                // Force update local state to match Firebase
                 isDrawing = shouldBeDrawing;
                 currentWord = state.currentWord || '';
+                
+                console.log(`Player ${playerId} isDrawing: ${isDrawing}, drawer is: ${state.currentDrawer}`);
                 
                 updateTurnIndicator(state.currentDrawer);
                 updateWordDisplay();
                 updateCanvasState();
                 updateChatState();
 
-                // Only the drawer controls the timer to prevent conflicts
+                // Only the drawer controls the timer
                 // And only if they just became the drawer
                 if (isDrawing && !wasDrawing && state.roundNumber) {
-                    // Double-check we're still the drawer before starting timer
+                    console.log('Just became drawer, showing word and starting timer');
+                    
+                    // Clear any stale modals first
+                    const oldModal = document.getElementById('wordSelectionModal');
+                    if (oldModal) oldModal.remove();
+                    
+                    // Triple-check we're still the drawer
                     roomRef.child('gameState/currentDrawer').once('value', (snap) => {
                         if (snap.val() === playerId) {
-                            startRoundTimer();
+                            setTimeout(() => {
+                                showWordSelection(currentWord);
+                                startRoundTimer();
+                            }, 300);
                         }
                     });
+                } else if (!isDrawing && wasDrawing) {
+                    console.log('No longer drawing, clearing timer and word modal');
+                    
+                    // Clear timer if we were drawing
+                    if (timerInterval) {
+                        clearInterval(timerInterval);
+                        timerInterval = null;
+                    }
+                    
+                    // Close word modal if open
+                    const modal = document.getElementById('wordSelectionModal');
+                    if (modal) modal.remove();
                 }
             }
 
@@ -1196,65 +1261,86 @@
         }
 
         function startNewRound() {
-            // Use Firebase transaction to prevent any race conditions
-            roomRef.child('gameState').transaction((currentState) => {
-                // If transaction fails, return undefined to abort
-                if (!currentState) return undefined;
-                
-                // If round is already starting, abort
-                if (currentState.roundStarting) {
-                    return undefined; // Abort - someone else is starting
+            console.log('startNewRound called by', playerId);
+            
+            // Prevent overlapping round starts
+            if (isTransitioning) {
+                console.log('Already transitioning, aborting');
+                return;
+            }
+            
+            isTransitioning = true;
+            
+            // CRITICAL: Only the leader (first player alphabetically) can start rounds
+            roomRef.child('players').once('value', (playersSnapshot) => {
+                const players = playersSnapshot.val();
+                if (!players) {
+                    isTransitioning = false;
+                    return;
                 }
+
+                const playerIds = Object.keys(players).sort();
+                const leaderId = playerIds[0]; // First player alphabetically is the leader
                 
-                // Mark that we're starting a round
-                currentState.roundStarting = true;
-                return currentState;
-                
-            }, (error, committed, snapshot) => {
-                if (error || !committed) {
-                    console.log('Round start aborted - another player starting');
+                // If I'm not the leader, abort immediately
+                if (playerId !== leaderId) {
+                    console.log('Not the leader, aborting round start');
+                    isTransitioning = false;
                     return;
                 }
                 
-                // We got the lock, now start the round
-                roomRef.child('players').once('value', (playersSnapshot) => {
-                    const players = playersSnapshot.val();
-                    if (!players) {
-                        roomRef.child('gameState/roundStarting').set(false);
-                        return;
-                    }
+                console.log('I am the leader, proceeding with round start');
+                
+                if (playerIds.length < 2) {
+                    console.log('Not enough players');
+                    isTransitioning = false;
+                    return;
+                }
 
-                    const playerIds = Object.keys(players).sort(); // Sort for consistent order
-                    if (playerIds.length < 2) {
-                        roomRef.child('gameState/roundStarting').set(false);
-                        return;
-                    }
-
-                    const gameState = snapshot.val();
+                // Get current game state
+                roomRef.child('gameState').once('value', (gameSnapshot) => {
+                    const gameState = gameSnapshot.val() || {};
                     
-                    // Get current turn index, default to -1 for first round
-                    const currentTurnIndex = gameState?.currentTurnIndex !== undefined ? gameState.currentTurnIndex : -1;
+                    // Prevent starting if a round is already active
+                    const now = Date.now();
+                    if (gameState.roundStartTime && (now - gameState.roundStartTime) < 5000) {
+                        console.log('Round recently started, aborting');
+                        isTransitioning = false;
+                        return;
+                    }
+                    
+                    // Get current turn index
+                    const currentTurnIndex = gameState.currentTurnIndex !== undefined ? gameState.currentTurnIndex : -1;
                     
                     // Calculate next turn index (round-robin)
                     const nextTurnIndex = (currentTurnIndex + 1) % playerIds.length;
                     const drawerId = playerIds[nextTurnIndex];
                     
+                    console.log(`Starting round ${(gameState.roundNumber || 0) + 1}, turn ${nextTurnIndex}, drawer: ${drawerId} (${players[drawerId]?.name})`);
+                    
+                    // Verify drawer exists
+                    if (!players[drawerId]) {
+                        console.log('Drawer not found, aborting');
+                        isTransitioning = false;
+                        return;
+                    }
+                    
                     const selectedWord = wordBank[Math.floor(Math.random() * wordBank.length)];
-                    const newRoundNumber = (gameState?.roundNumber || 0) + 1;
+                    const newRoundNumber = (gameState.roundNumber || 0) + 1;
 
-                    // Create comprehensive update
+                    // Create comprehensive atomic update
                     const updates = {};
                     
-                    // CRITICAL: Set all players as NOT drawing first
+                    // CRITICAL: Set ALL players to NOT drawing
                     playerIds.forEach(id => {
                         updates[`players/${id}/isDrawing`] = false;
                         updates[`players/${id}/guessedCorrectly`] = false;
                     });
                     
-                    // Set ONLY ONE drawer
+                    // Set ONLY the current drawer
                     updates[`players/${drawerId}/isDrawing`] = true;
 
-                    // Update game state
+                    // Update game state with all info
                     updates['gameState/started'] = true;
                     updates['gameState/currentDrawer'] = drawerId;
                     updates['gameState/currentWord'] = selectedWord;
@@ -1262,31 +1348,34 @@
                     updates['gameState/currentTurnIndex'] = nextTurnIndex;
                     updates['gameState/timeLeft'] = 90;
                     updates['gameState/roundStartTime'] = Date.now();
-                    updates['gameState/roundStarting'] = false; // Release lock
                     updates['drawing'] = null; // Clear canvas
 
-                    // Single atomic update
+                    // Single atomic Firebase update
                     roomRef.update(updates).then(() => {
-                        console.log(`Round ${newRoundNumber}: ${players[drawerId].name} (${drawerId}) is drawing (Turn ${nextTurnIndex + 1}/${playerIds.length})`);
+                        console.log(`Round ${newRoundNumber} started successfully - Drawer: ${players[drawerId].name}`);
+                        isTransitioning = false;
                         
-                        // Only show word to the actual drawer
+                        // Add system message (leader only)
+                        addSystemMessage(`Round ${newRoundNumber}: ${players[drawerId].name} is drawing!`);
+                        
+                        // If I'm the drawer, show word and start timer
                         if (drawerId === playerId) {
                             setTimeout(() => {
                                 showWordSelection(selectedWord);
                                 startRoundTimer();
-                            }, 800);
+                            }, 500);
                         }
-                        
-                        addSystemMessage(`Round ${newRoundNumber}: ${players[drawerId].name} is drawing!`);
                     }).catch(error => {
                         console.error('Error starting round:', error);
-                        roomRef.child('gameState/roundStarting').set(false);
+                        isTransitioning = false;
                     });
                 });
-            }, false); // Don't apply locally
+            });
         }
 
         function startRoundTimer() {
+            console.log('startRoundTimer called');
+            
             // Clear any existing timer first
             if (timerInterval) {
                 clearInterval(timerInterval);
@@ -1294,22 +1383,34 @@
             }
             
             // Only the drawer runs the timer
-            if (!isDrawing) return;
+            if (!isDrawing) {
+                console.log('Not drawing, not starting timer');
+                return;
+            }
             
-            // Double-check we're still the drawer
-            roomRef.child('gameState/currentDrawer').once('value', (snap) => {
-                if (snap.val() !== playerId) {
-                    console.log('Not the drawer anymore, aborting timer');
+            // Get current round number to track
+            roomRef.child('gameState').once('value', (stateSnap) => {
+                const gameState = stateSnap.val();
+                if (!gameState || gameState.currentDrawer !== playerId) {
+                    console.log('Not the drawer, aborting timer');
                     return;
                 }
+                
+                const myRoundNumber = gameState.roundNumber;
+                console.log(`Starting timer for round ${myRoundNumber}`);
 
                 let timeLeft = 90; // 1 minute 30 seconds
                 
                 timerInterval = setInterval(() => {
-                    // Verify we're still the drawer before updating
-                    roomRef.child('gameState/currentDrawer').once('value', (drawerSnap) => {
-                        if (drawerSnap.val() !== playerId) {
-                            // We're not the drawer anymore, stop the timer
+                    // Verify we're still the drawer AND same round
+                    roomRef.child('gameState').once('value', (checkSnap) => {
+                        const currentState = checkSnap.val();
+                        
+                        // Stop if round changed or we're not drawer anymore
+                        if (!currentState || 
+                            currentState.currentDrawer !== playerId || 
+                            currentState.roundNumber !== myRoundNumber) {
+                            console.log('Round changed or not drawer, stopping timer');
                             clearInterval(timerInterval);
                             timerInterval = null;
                             return;
@@ -1321,9 +1422,14 @@
                         roomRef.child('gameState/timeLeft').set(timeLeft);
 
                         if (timeLeft <= 0) {
+                            console.log('Timer reached 0, ending round');
                             clearInterval(timerInterval);
                             timerInterval = null;
-                            endRound();
+                            
+                            // Only end round if I'm still the drawer
+                            if (currentState.currentDrawer === playerId) {
+                                endRound();
+                            }
                         }
                     });
                 }, 1000);
@@ -1331,9 +1437,14 @@
         }
 
         function endRound(allGuessed = false, winnerNames = []) {
+            console.log('endRound called');
+            
             // Prevent multiple calls
             if (!roundEnding) {
                 roundEnding = true;
+            } else {
+                console.log('Round already ending, skipping');
+                return;
             }
 
             // Clear timer if running
@@ -1348,19 +1459,27 @@
                 
                 setTimeout(() => {
                     hasGuessedCorrectly = false;
-                    roundEnding = false; // Reset flag for next round
                     clearCanvas(); // Clear the board before next round
                     
-                    // Auto-start next round with random delay
-                    const delay = Math.random() * 600 + 400; // 0.4-1 second
-                    setTimeout(() => {
-                        // Verify game state before starting
-                        roomRef.child('gameState/roundStarting').once('value', (startingSnap) => {
-                            if (!startingSnap.val()) {
+                    // Determine if I'm the leader
+                    roomRef.child('players').once('value', (playersSnap) => {
+                        const players = playersSnap.val() || {};
+                        const playerIds = Object.keys(players).sort();
+                        const leaderId = playerIds[0];
+                        const isLeader = (leaderId === playerId);
+                        
+                        roundEnding = false; // Reset flag
+                        
+                        // Only leader starts next round
+                        if (isLeader && playerIds.length >= 2) {
+                            console.log('Leader starting next round');
+                            setTimeout(() => {
                                 startNewRound();
-                            }
-                        });
-                    }, delay);
+                            }, 500);
+                        } else {
+                            console.log('Not leader, waiting for next round');
+                        }
+                    });
                 }, 4000);
             });
         }
@@ -1846,5 +1965,12 @@
 
         clearCanvas();
     </script>
+
+    <!-- Footer -->
+    <div class="footer">
+        <div class="footer-content">
+            © 2025 - Created by Hani Benbelkacem
+        </div>
+    </div>
 </body>
 </html>
